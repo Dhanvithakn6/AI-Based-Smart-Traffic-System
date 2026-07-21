@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment files
+.env
+
+# Traffic videos
+lane1.mp4
+lane2.mp4
+lane3.mp4
+lane4.mp4
+
+# YOLO model
+yolov8n.pt
