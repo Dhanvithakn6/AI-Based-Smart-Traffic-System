@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import json
 from ultralytics import YOLO
 import time
 import threading
@@ -14,7 +15,7 @@ class LaneProcessor:
         self.cap = cv2.VideoCapture(video_path)
 
         # YOLO model
-        self.model = YOLO("yolov8n.pt")
+        self.model = YOLO("yolov11n.pt")
 
         # Vehicle class IDs
         self.vehicle_classes = {
@@ -32,15 +33,45 @@ class LaneProcessor:
             "truck": 5
         }
 
-        # Relative lane widths
-        lane_widths = {
-            1: 8,
-            2: 5,
-            3: 7,
-            4: 6
-        }
+                       # Load lane-specific metric calibration
+        config_file = f"config_lane{lane_id}.json"
 
-        self.road_width = lane_widths.get(lane_id, 6)
+        if os.path.exists(config_file):
+            with open(config_file, "r") as f:
+                calibration = json.load(f)
+
+            self.road_width = float(calibration["reference_width_m"])
+
+            # Homography: image pixels -> real-world ground coordinates
+            self.H = np.array(
+                calibration["homography_matrix"],
+                dtype=np.float64
+            )
+
+            # Monitoring zone in meters
+            zone = calibration.get(
+                "monitoring_zone_meters",
+                {
+                    "min_y": 0.0,
+                    "max_y": 20.0
+                }
+            )
+
+            self.min_y = float(zone["min_y"])
+            self.max_y = float(zone["max_y"])
+
+            print(
+                f"✅ Lane {lane_id} calibration loaded | "
+                f"Width = {self.road_width:.2f} m | "
+                f"Zone = {self.min_y:.1f}-{self.max_y:.1f} m"
+            )
+
+        else:
+            print(f"⚠️ Calibration file not found: {config_file}")
+            self.road_width = 1.0
+            self.H = np.eye(3)
+            self.min_y = 0.0
+            self.max_y = 20.0
 
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -67,6 +98,10 @@ class LaneProcessor:
             
         results = self.model(self.current_frame, verbose=False)
         current_count = 0
+        self.car_count = 0
+        self.bike_count = 0
+        self.bus_count = 0
+        self.truck_count = 0
         
         for result in results:
             boxes = result.boxes
@@ -75,17 +110,43 @@ class LaneProcessor:
                     cls_id = int(box.cls[0])
                     conf = float(box.conf[0])
                     if cls_id in self.vehicle_classes and conf > 0.5:
+                        class_name = self.vehicle_classes[cls_id]
+
                         current_count += 1
+
+                        if class_name == "car":
+                            self.car_count += 1
+                        elif class_name == "bike":
+                            self.bike_count += 1
+                        elif class_name == "bus":
+                            self.bus_count += 1
+                        elif class_name == "truck":
+                            self.truck_count += 1
+
                         # Draw bounding box
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                        cv2.rectangle(self.current_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                        cv2.rectangle(
+                            self.current_frame,
+                            (x1, y1),
+                            (x2, y2),
+                            (0, 255, 255),
+                            2
+                        )
                         
-       # Update count using moving average
+               # Update count using moving average
         self.detection_history.append(current_count)
         self.vehicle_count = int(np.mean(self.detection_history))
 
-       # Temporary congestion score
-        self.congestion_score = self.vehicle_count / self.road_width
+        # Weighted congestion score
+        weighted_count = (
+            self.bike_count * 1 +
+            self.car_count * 2 +
+            self.bus_count * 4 +
+            self.truck_count * 5
+        )
+
+        self.weighted_count = weighted_count
+        self.congestion_score = weighted_count / self.road_width
         
     def read_frame(self):
         """Read next frame and loop video when it ends"""
@@ -400,9 +461,21 @@ class FourLaneTrafficSystem:
         print("=" * 50)
         self.create_windows()
         
-        # Initial green signal
-        self.controller.switch_green_lane(0)
-        
+                # Analyze all four lanes before assigning the first green signal
+        self.process_all_lanes()
+
+        initial_lane = max(
+            range(4),
+            key=lambda i: self.controller.lanes[i].congestion_score
+        )
+
+        self.controller.switch_green_lane(initial_lane)
+
+        print(
+            f"🚦 Initial priority: Lane {initial_lane + 1} "
+            f"(Congestion: {self.controller.lanes[initial_lane].congestion_score:.2f})"
+        )
+
         fps_counter = 0
         fps_time = time.time()
         
