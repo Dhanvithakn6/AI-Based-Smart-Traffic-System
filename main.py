@@ -12,7 +12,9 @@ class LaneProcessor:
     
     def __init__(self, video_path, lane_id):
         self.lane_id = lane_id
+        self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
+        self.is_eof = False
 
         # YOLO model
         self.model = YOLO("yolov11n.pt")
@@ -90,63 +92,150 @@ class LaneProcessor:
         self.congestion_score = 0
 
         self.detection_history = deque(maxlen=10)
-        
+    def pixel_to_meters(self, u, v):
+        """Convert image pixel coordinates to ground-plane meters."""
+        point = np.array(
+            [u, v, 1.0],
+            dtype=np.float64
+        ).reshape(3, 1)
+
+        world_point = self.H @ point
+
+        if abs(world_point[2, 0]) < 1e-9:
+            return None, None
+
+        world_point /= world_point[2, 0]
+
+        return (
+            float(world_point[0, 0]),
+            float(world_point[1, 0])
+        )
+  
     def detect_vehicles(self):
-        """Detect vehicles in current frame"""
+        """Detect vehicles and count only vehicles inside metric monitoring zone."""
         if self.current_frame is None:
             return
-            
+
         results = self.model(self.current_frame, verbose=False)
+
         current_count = 0
+
         self.car_count = 0
         self.bike_count = 0
         self.bus_count = 0
         self.truck_count = 0
-        
+
         for result in results:
             boxes = result.boxes
-            if boxes is not None:
-                for box in boxes:
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    if cls_id in self.vehicle_classes and conf > 0.5:
-                        class_name = self.vehicle_classes[cls_id]
 
-                        current_count += 1
+            if boxes is None:
+                continue
 
-                        if class_name == "car":
-                            self.car_count += 1
-                        elif class_name == "bike":
-                            self.bike_count += 1
-                        elif class_name == "bus":
-                            self.bus_count += 1
-                        elif class_name == "truck":
-                            self.truck_count += 1
+            for box in boxes:
 
-                        # Draw bounding box
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                        cv2.rectangle(
-                            self.current_frame,
-                            (x1, y1),
-                            (x2, y2),
-                            (0, 255, 255),
-                            2
-                        )
-                        
-               # Update count using moving average
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+
+                if cls_id not in self.vehicle_classes or conf <= 0.5:
+                    continue
+
+                # Bounding box
+                x1, y1, x2, y2 = (
+                    box.xyxy[0]
+                    .cpu()
+                    .numpy()
+                    .astype(int)
+                )
+
+                # Bottom-center = approximate vehicle/road contact point
+                u_center = (x1 + x2) / 2.0
+                v_bottom = float(y2)
+
+                # Convert pixel -> ground-plane meters
+                x_m, y_m = self.pixel_to_meters(
+                    u_center,
+                    v_bottom
+                )
+
+                # If transformation failed
+                if x_m is None or y_m is None:
+                    continue
+
+                class_name = self.vehicle_classes[cls_id]
+
+                # -------------------------------------------------
+                # MONITORING ZONE FILTER
+                # Only vehicles between 0m and 20m are counted
+                # -------------------------------------------------
+                inside_zone = (
+                    self.min_y <= y_m <= self.max_y
+                )
+
+                if inside_zone:
+
+                    current_count += 1
+
+                    if class_name == "car":
+                        self.car_count += 1
+
+                    elif class_name == "bike":
+                        self.bike_count += 1
+
+                    elif class_name == "bus":
+                        self.bus_count += 1
+
+                    elif class_name == "truck":
+                        self.truck_count += 1
+
+                    # Green = vehicle contributes to congestion
+                    box_color = (0, 255, 0)
+
+                    cv2.putText(
+                        self.current_frame,
+                        f"{y_m:.1f}m",
+                        (x1, max(15, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),
+                        1
+                    )
+
+                else:
+
+                    # Gray = detected but outside monitoring zone
+                    box_color = (100, 100, 100)
+
+                cv2.rectangle(
+                    self.current_frame,
+                    (x1, y1),
+                    (x2, y2),
+                    box_color,
+                    2
+                )
+
+        # Moving average of vehicles INSIDE monitoring zone
         self.detection_history.append(current_count)
-        self.vehicle_count = int(np.mean(self.detection_history))
 
-        # Weighted congestion score
+        self.vehicle_count = int(
+            np.mean(self.detection_history)
+        )
+
+        # Weighted congestion
         weighted_count = (
-            self.bike_count * 1 +
-            self.car_count * 2 +
-            self.bus_count * 4 +
-            self.truck_count * 5
+            self.bike_count * self.vehicle_weights["bike"] +
+            self.car_count * self.vehicle_weights["car"] +
+            self.bus_count * self.vehicle_weights["bus"] +
+            self.truck_count * self.vehicle_weights["truck"]
         )
 
         self.weighted_count = weighted_count
-        self.congestion_score = weighted_count / self.road_width
+
+        # Density relative to calibrated road width
+        self.congestion_score = (
+            weighted_count / self.road_width
+            if self.road_width > 0
+            else 0
+        )
         
     def read_frame(self):
         """Read next frame and loop video when it ends"""
