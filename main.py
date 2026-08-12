@@ -238,20 +238,26 @@ class LaneProcessor:
         )
         
     def read_frame(self):
-        """Read next frame and loop video when it ends"""
+        """Read next frame and stop at EOF for synchronized reset."""
+
+        if self.is_eof:
+            return True
 
         ret, frame = self.cap.read()
 
-        # If video ended, restart it
         if not ret:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = self.cap.read()
+            self.is_eof = True
+            return True
 
-        if ret:
-            self.current_frame = frame.copy()
-            self.detect_vehicles()
+        self.current_frame = frame.copy()
+        self.detect_vehicles()
 
-        return ret
+        return True
+
+    def reset_video(self):
+        """Restart video from frame 0."""
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.is_eof = False
     
         
         # Lane header
@@ -340,41 +346,9 @@ class TrafficSignalController:
         return 30
     
     def select_next_lane(self):
-        """Intelligent lane selection with fairness"""
-        current_time = time.time()
-        
-        # Calculate wait times
-        for i in range(4):
-            self.wait_time[i] = current_time - self.last_green_time[i]
-        
-        # At 80% of current signal time, evaluate other lanes
-        elapsed = current_time - self.signal_start_time
-        if elapsed > 0.8 * self.signal_duration:
-            
-            # Candidates: all lanes except current green
-            candidates = [
-                (
-                    i,
-                    lane.congestion_score,
-                    lane.vehicle_count,
-                    self.wait_time[i]
-                )
-                for i, lane in enumerate(self.lanes)
-                if i != self.current_green_lane
-            ]
-            
-            if candidates:
-                # Priority: density (70%) + fairness (30%)
-                candidates.sort(key=lambda x: (
-                    x[1] * 0.8 +  # Density priority
-                    (x[3] / self.fairness_threshold) * 0.3  # Fairness boost
-                ), reverse=True)
-                
-                next_lane = candidates[0][0]
-            else:
-                next_lane = (self.current_green_lane + 1) % 4
-            
-            self.switch_green_lane(next_lane)
+        """Strict Round-Robin lane selection (1->2->3->4)"""
+        next_lane = (self.current_green_lane + 1) % 4
+        self.switch_green_lane(next_lane)
     
     def switch_green_lane(self, lane_id):
         """Switch to new green lane"""
