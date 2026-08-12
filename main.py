@@ -419,21 +419,28 @@ class FourLaneTrafficSystem:
         cv2.resizeWindow("AI Smart Traffic Dashboard", 1920, 1080)
     
     def process_all_lanes(self):
-        """Process one frame from each lane"""
+        """Process all lanes and restart videos together after all reach EOF."""
+
+        # Restart ALL videos only when ALL four have reached EOF
+        if all(lane.is_eof for lane in self.controller.lanes):
+            print("🔄 Dataset Round Complete: Restarting all lanes from frame 0...")
+
+            for lane in self.controller.lanes:
+                lane.reset_video()
+
         frames = []
-        all_active = True
-        
+
         for lane in self.controller.lanes:
-            ret = lane.read_frame()
-            if ret:
-                # Add signal status
-                frame = self.controller.draw_signal_status(lane.get_frame(), lane.lane_id - 1)
-                frames.append(frame)
-            else:
-                all_active = False
-                frames.append(None)
-        
-        return frames, all_active
+            lane.read_frame()
+
+            frame = self.controller.draw_signal_status(
+                lane.get_frame(),
+                lane.lane_id - 1
+            )
+
+            frames.append(frame)
+
+        return frames, True
     
     def display_frames(self, frames):
         """Display all 4 lanes in one dashboard"""
