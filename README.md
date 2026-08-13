@@ -21,7 +21,7 @@ This project presents an AI-based smart traffic management system that performs 
 ## Tech Stack
 
 - Python
-- YOLOv8 (Ultralytics)
+- YOLOv11n (Ultralytics)
 - OpenCV
 - NumPy
 
