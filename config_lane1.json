@@ -1,4 +1,8 @@
 {
+    "monitoring_zone_meters": {
+    "min_y": 0.0,
+    "max_y": 20.0
+},
     "lane_id": 1,
     "coordinate_unit": "meters",
     "homography_matrix": [

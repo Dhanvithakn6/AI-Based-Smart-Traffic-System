@@ -11,16 +11,17 @@ class LaneProcessor:
     """Processes individual lane video and detects vehicles"""
     
     def __init__(self, video_path, lane_id):
-        self.lane_id = lane_id
-        self.video_path = video_path
-        self.cap = cv2.VideoCapture(video_path)
-        self.is_eof = False
+         self.lane_id = lane_id
+         self.video_path = video_path
+         self.cap = cv2.VideoCapture(video_path)
+         self.display_frame = None
+         self.is_eof = False
 
         # YOLO model
-        self.model = YOLO("yolov11n.pt")
+         self.model = YOLO("yolov11n.pt")
 
         # Vehicle class IDs
-        self.vehicle_classes = {
+         self.vehicle_classes = {
             2: "car",
             3: "bike",
             5: "bus",
@@ -28,7 +29,7 @@ class LaneProcessor:
        }
 
         # Vehicle weights
-        self.vehicle_weights = {
+         self.vehicle_weights = {
             "bike": 1,
             "car": 2,
             "bus": 4,
@@ -36,9 +37,9 @@ class LaneProcessor:
         }
 
                        # Load lane-specific metric calibration
-        config_file = f"config_lane{lane_id}.json"
+         config_file = f"config_lane{lane_id}.json"
 
-        if os.path.exists(config_file):
+         if os.path.exists(config_file):
             with open(config_file, "r") as f:
                 calibration = json.load(f)
 
@@ -68,30 +69,30 @@ class LaneProcessor:
                 f"Zone = {self.min_y:.1f}-{self.max_y:.1f} m"
             )
 
-        else:
+         else:
             print(f"⚠️ Calibration file not found: {config_file}")
             self.road_width = 1.0
             self.H = np.eye(3)
             self.min_y = 0.0
             self.max_y = 20.0
 
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        self.current_frame = None
+         self.current_frame = None
 
         # Vehicle statistics
-        self.vehicle_count = 0
-        self.car_count = 0
-        self.bike_count = 0
-        self.bus_count = 0
-        self.truck_count = 0
+         self.vehicle_count = 0
+         self.car_count = 0
+         self.bike_count = 0
+         self.bus_count = 0
+         self.truck_count = 0
 
-        self.weighted_count = 0
-        self.queue_length = 0
-        self.congestion_score = 0
+         self.weighted_count = 0
+         self.queue_length = 0
+         self.congestion_score = 0
 
-        self.detection_history = deque(maxlen=10)
+         self.detection_history = deque(maxlen=10)
     def pixel_to_meters(self, u, v):
         """Convert image pixel coordinates to ground-plane meters."""
         point = np.array(
@@ -237,21 +238,23 @@ class LaneProcessor:
             else 0
         )
         
-    def read_frame(self):
-        """Read next frame and stop at EOF for synchronized reset."""
-
+    def read_frame(self, visible=True):
+        """Read next frame. If visible=False, analyze but do not update dashboard display."""
         if self.is_eof:
             return True
 
         ret, frame = self.cap.read()
-
         if not ret:
             self.is_eof = True
             return True
 
         self.current_frame = frame.copy()
-        self.detect_vehicles()
+        
+        # Update display_frame only if this lane is currently 'active' visually
+        if visible or self.display_frame is None:
+            self.display_frame = frame.copy()
 
+        self.detect_vehicles()
         return True
 
     def reset_video(self):
@@ -300,8 +303,8 @@ class LaneProcessor:
         return self.current_frame
     
     def get_frame(self):
-        """Get processed frame with annotations"""
-        return self.current_frame
+        """Return the frame designated for display (stays frozen if not active)."""
+        return self.display_frame if self.display_frame is not None else self.current_frame
 
 class TrafficSignalController:
     """Manages 4-lane traffic signal logic"""
@@ -346,9 +349,11 @@ class TrafficSignalController:
         return 30
     
     def select_next_lane(self):
-        """Strict Round-Robin lane selection (1->2->3->4)"""
-        next_lane = (self.current_green_lane + 1) % 4
-        self.switch_green_lane(next_lane)
+        """Strict Round-Robin selection. Order: 1 -> 2 -> 3 -> 4."""
+        next_lane_idx = (self.current_green_lane + 1) % 4
+        # Note: adaptive duration is calculated inside switch_green_lane 
+        # using the vehicle_count prepared during the 5s background analysis.
+        self.switch_green_lane(next_lane_idx)
     
     def switch_green_lane(self, lane_id):
         """Switch to new green lane"""
@@ -381,12 +386,14 @@ class TrafficSignalController:
         
         cv2.circle(frame, (light_x, light_y), 30, (0, 0, 100), -1)  # Background
         
+        next_lane_idx = (self.current_green_lane + 1) % 4
+        
         if lane_id == self.current_green_lane:
-            color = (0, 255, 0)  # Green
-            status = "GREEN"
+            color, status = (0, 255, 0), "GREEN"
+        elif lane_id == next_lane_idx and self.time_remaining <= 5:
+            color, status = (0, 255, 255), "YELLOW"
         else:
-            color = (0, 0, 255)  # Red
-            status = "RED"
+            color, status = (0, 0, 255), "RED"
         
         cv2.circle(frame, (light_x, light_y), 25, color, -1)
         
@@ -430,14 +437,20 @@ class FourLaneTrafficSystem:
 
         frames = []
 
-        for lane in self.controller.lanes:
-            lane.read_frame()
+        curr_green = self.controller.current_green_lane
+        next_lane = (curr_green + 1) % 4
+        is_pre_analysis_period = self.controller.time_remaining <= 5
 
-            frame = self.controller.draw_signal_status(
-                lane.get_frame(),
-                lane.lane_id - 1
-            )
-
+        for i, lane in enumerate(self.controller.lanes):
+            if i == curr_green:
+                # Active Green: Advance video visually and analyze
+                lane.read_frame(visible=True)
+            elif i == next_lane and is_pre_analysis_period:
+                # Background Yellow: Analyze traffic but keep dashboard video frozen
+                lane.read_frame(visible=False)
+            
+            # Non-active lanes return their last frozen 'display_frame'
+            frame = self.controller.draw_signal_status(lane.get_frame(), i)
             frames.append(frame)
 
         return frames, True
@@ -494,8 +507,17 @@ class FourLaneTrafficSystem:
                         (0,255,255),
                         2)
 
-            color = (0,255,0) if i == self.controller.current_green_lane else (0,0,255)
-            status = "GREEN" if i == self.controller.current_green_lane else "RED"
+            next_lane = (self.controller.current_green_lane + 1) % 4
+
+            if i == self.controller.current_green_lane:
+                color = (0,255,0)
+                status = "GREEN"
+            elif i == next_lane and self.controller.time_remaining <= 5:
+                color = (0,255,255)
+                status = "YELLOW"
+            else:
+                color = (0,0,255)
+                status = "RED"
 
             cv2.circle(frame,(740,22),14,color,-1)
 
@@ -532,7 +554,8 @@ class FourLaneTrafficSystem:
         self.create_windows()
         
                 # Analyze all four lanes before assigning the first green signal
-        self.process_all_lanes()
+        for lane in self.controller.lanes:
+            lane.read_frame(visible=True)
 
         initial_lane = max(
             range(4),
