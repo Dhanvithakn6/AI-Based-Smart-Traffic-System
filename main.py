@@ -10,15 +10,41 @@ import os
 class LaneProcessor:
     """Processes individual lane video and detects vehicles"""
     
-    def __init__(self, video_path, lane_id):
+    def __init__(
+        self,
+        video_path,
+        lane_id,
+        emergency_model=None,
+        emergency_state_lock=None
+    ):
          self.lane_id = lane_id
          self.video_path = video_path
          self.cap = cv2.VideoCapture(video_path)
+         self.traffic_cap = cv2.VideoCapture(video_path)
          self.display_frame = None
          self.is_eof = False
 
-        # YOLO model
+         # Normal traffic model
          self.model = YOLO("yolov11n.pt")
+
+# Emergency model is passed from the controller
+         self.emergency_model = emergency_model
+         self.emergency_state_lock = (
+             emergency_state_lock or threading.Lock()
+         )
+
+# Emergency detection state
+         self.ambulance_detected = False
+         self.consecutive_ambulance_frames = 0
+         self.clearance_counter = 0
+         self.clearance_started_at = None
+         self.last_emergency_diagnostic_at = 0.0
+
+         self.REQUIRED_CONFIRMATION_FRAMES = 5
+         self.AMBULANCE_CLEARANCE_FRAMES = 15
+
+# Separate video stream for background ambulance monitoring
+         self.emergency_cap = cv2.VideoCapture(video_path)
 
         # Vehicle class IDs
          self.vehicle_classes = {
@@ -93,6 +119,201 @@ class LaneProcessor:
          self.congestion_score = 0
 
          self.detection_history = deque(maxlen=10)
+         self.statistics_lock = threading.Lock()
+         self._analysis_requests = threading.Semaphore(0)
+         self._analysis_request_lock = threading.Lock()
+         self._pending_analysis_request_ids = deque()
+         self._next_analysis_request_id = 0
+         self._completed_analysis_request_id = 0
+         self._analysis_stop_event = threading.Event()
+         self._inference_error = None
+         self.detection_overlay = []
+         self.inference_count = 0
+         self.inference_elapsed = 0.0
+         self.traffic_measurement_ready = False
+         self.analysis_revision = 0
+         self._inference_thread = None
+
+    def start_traffic_analysis(self):
+        if self._inference_thread is not None:
+            return
+
+        self._inference_thread = threading.Thread(
+            target=self._vehicle_inference_loop,
+            name=f"vehicle-inference-lane-{self.lane_id}",
+            daemon=True
+        )
+        self._inference_thread.start()
+
+    def request_traffic_analysis(self):
+        """Request one background analysis without waiting for the worker."""
+        if self._inference_error is not None:
+            self.check_traffic_analysis_error()
+        if self._inference_thread is None:
+            raise RuntimeError(
+                f"Traffic analysis has not started for lane {self.lane_id}"
+            )
+        with self._analysis_request_lock:
+            self._next_analysis_request_id += 1
+            request_id = self._next_analysis_request_id
+            self._pending_analysis_request_ids.append(request_id)
+        self._analysis_requests.release()
+        return request_id
+
+    def is_traffic_analysis_complete(self, request_id):
+        with self._analysis_request_lock:
+            return self._completed_analysis_request_id >= request_id
+
+    def _set_traffic_analysis_error(self, error):
+        self._inference_error = error
+
+    def _vehicle_inference_loop(self):
+        while not self._analysis_stop_event.is_set():
+            if not self._analysis_requests.acquire(timeout=0.1):
+                continue
+            if self._analysis_stop_event.is_set():
+                return
+
+            with self._analysis_request_lock:
+                request_id = self._pending_analysis_request_ids.popleft()
+
+            started_at = time.perf_counter()
+            try:
+                ret, frame = self.traffic_cap.read()
+                if not ret:
+                    self.traffic_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.traffic_cap.read()
+                if not ret:
+                    raise RuntimeError(
+                        f"Unable to read traffic-analysis video for "
+                        f"lane {self.lane_id}"
+                    )
+                self.current_frame = frame
+                annotations = self.detect_vehicles()
+            except Exception as error:
+                self._set_traffic_analysis_error(error)
+                return
+
+            elapsed = time.perf_counter() - started_at
+            with self.statistics_lock:
+                self.detection_overlay = annotations
+                self.inference_count += 1
+                self.inference_elapsed += elapsed
+                self.traffic_measurement_ready = True
+                self.analysis_revision += 1
+            with self._analysis_request_lock:
+                self._completed_analysis_request_id = request_id
+
+    def stop_vehicle_detection(self):
+        self._analysis_stop_event.set()
+        self._analysis_requests.release()
+        if self._inference_thread is not None:
+            self._inference_thread.join()
+
+    def check_traffic_analysis_error(self):
+        if self._inference_error is not None:
+            raise RuntimeError(
+                f"Traffic analysis failed for lane {self.lane_id}"
+            ) from self._inference_error
+
+    def detect_emergency(self, frame):
+        """Background ambulance detection using the dedicated ambulance model."""
+        if frame is None or self.emergency_model is None:
+             return False
+
+        results = self.emergency_model(
+        frame,
+        conf=0.70,
+        classes=[0],
+        verbose=False
+       )
+
+        confidence = max(
+            (
+                float(box.conf[0])
+                for result in results
+                if result.boxes is not None
+                for box in result.boxes
+            ),
+            default=0.0
+        )
+        found = confidence >= 0.70
+
+        clearance_message = None
+        if found:
+            print(
+                f"🚨 Ambulance candidate: Lane {self.lane_id}, "
+                f"confidence = {confidence:.2f}"
+            )
+
+        with self.emergency_state_lock:
+            if found:
+                self.consecutive_ambulance_frames += 1
+                self.clearance_counter = 0
+                self.clearance_started_at = None
+
+                if (
+                    self.consecutive_ambulance_frames
+                    >= self.REQUIRED_CONFIRMATION_FRAMES
+                ):
+                    if not self.ambulance_detected:
+                        print(
+                            f"✅ Ambulance confirmed: Lane {self.lane_id}"
+                        )
+                    self.ambulance_detected = True
+            else:
+                self.consecutive_ambulance_frames = 0
+
+            if self.ambulance_detected and not found:
+                if self.clearance_counter == 0:
+                    self.clearance_started_at = time.monotonic()
+                self.clearance_counter += 1
+
+                now = time.monotonic()
+                if (
+                    self.clearance_counter
+                    >= self.AMBULANCE_CLEARANCE_FRAMES
+                ):
+                    elapsed = now - self.clearance_started_at
+                    clearance_message = (
+                        f"\n🏥 Emergency cleared | "
+                        f"Lane {self.lane_id} | "
+                        f"clear_count={self.clearance_counter}/"
+                        f"{self.AMBULANCE_CLEARANCE_FRAMES} | "
+                        f"elapsed={elapsed:.2f}s"
+                    )
+                    self.ambulance_detected = False
+                    self.clearance_counter = 0
+                    self.clearance_started_at = None
+                elif now - self.last_emergency_diagnostic_at >= 1.0:
+                    elapsed = now - self.clearance_started_at
+                    print(
+                        f"Emergency Lane {self.lane_id} | "
+                        f"ambulance confidence={confidence:.2f} | "
+                        f"clear_count={self.clearance_counter}/"
+                        f"{self.AMBULANCE_CLEARANCE_FRAMES} | "
+                        f"clear_elapsed={elapsed:.2f}s"
+                    )
+                    self.last_emergency_diagnostic_at = now
+            elif self.ambulance_detected:
+                now = time.monotonic()
+                if now - self.last_emergency_diagnostic_at >= 1.0:
+                    print(
+                        f"Emergency Lane {self.lane_id} | "
+                        f"ambulance confidence={confidence:.2f} | "
+                        f"clear_count=0/"
+                        f"{self.AMBULANCE_CLEARANCE_FRAMES}"
+                    )
+                    self.last_emergency_diagnostic_at = now
+            else:
+                self.clearance_counter = 0
+
+            is_detected = self.ambulance_detected
+
+        if clearance_message is not None:
+            print(clearance_message)
+
+        return is_detected
     def pixel_to_meters(self, u, v):
         """Convert image pixel coordinates to ground-plane meters."""
         point = np.array(
@@ -115,16 +336,22 @@ class LaneProcessor:
     def detect_vehicles(self):
         """Detect vehicles and count only vehicles inside metric monitoring zone."""
         if self.current_frame is None:
-            return
+            return []
 
-        results = self.model(self.current_frame, verbose=False)
+        results = self.model(
+            self.current_frame,
+            conf=0.25,
+            imgsz=960,
+            classes=[2, 3, 5, 7],
+            verbose=False
+        )
 
         current_count = 0
-
-        self.car_count = 0
-        self.bike_count = 0
-        self.bus_count = 0
-        self.truck_count = 0
+        car_count = 0
+        bike_count = 0
+        bus_count = 0
+        truck_count = 0
+        annotations = []
 
         for result in results:
             boxes = result.boxes
@@ -137,7 +364,7 @@ class LaneProcessor:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
 
-                if cls_id not in self.vehicle_classes or conf <= 0.5:
+                if cls_id not in self.vehicle_classes or conf < 0.25:
                     continue
 
                 # Bounding box
@@ -152,59 +379,38 @@ class LaneProcessor:
                 u_center = (x1 + x2) / 2.0
                 v_bottom = float(y2)
 
-                # Convert pixel -> ground-plane meters
-                x_m, y_m = self.pixel_to_meters(
-                    u_center,
-                    v_bottom
-                )
-
-                # If transformation failed
-                if x_m is None or y_m is None:
-                    continue
-
                 class_name = self.vehicle_classes[cls_id]
-
-                # -------------------------------------------------
-                # MONITORING ZONE FILTER
-                # Only vehicles between 0m and 20m are counted
-                # -------------------------------------------------
+                x_m, y_m = self.pixel_to_meters(u_center, v_bottom)
+                mapped = (
+                    x_m is not None
+                    and y_m is not None
+                    and np.isfinite(x_m)
+                    and np.isfinite(y_m)
+                )
                 inside_zone = (
-                    self.min_y <= y_m <= self.max_y
+                    mapped and self.min_y <= y_m <= self.max_y
                 )
 
                 if inside_zone:
-
                     current_count += 1
 
                     if class_name == "car":
-                        self.car_count += 1
-
+                        car_count += 1
                     elif class_name == "bike":
-                        self.bike_count += 1
-
+                        bike_count += 1
                     elif class_name == "bus":
-                        self.bus_count += 1
-
+                        bus_count += 1
                     elif class_name == "truck":
-                        self.truck_count += 1
+                        truck_count += 1
 
-                    # Green = vehicle contributes to congestion
                     box_color = (0, 255, 0)
-
-                    cv2.putText(
-                        self.current_frame,
-                        f"{y_m:.1f}m",
-                        (x1, max(15, y1 - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 255, 0),
-                        1
-                    )
-
-                else:
-
-                    # Gray = detected but outside monitoring zone
+                    label = f"{class_name} {conf:.2f} | {y_m:.1f}m"
+                elif mapped:
                     box_color = (100, 100, 100)
+                    label = f"{class_name} {conf:.2f} | outside zone"
+                else:
+                    box_color = (0, 165, 255)
+                    label = f"{class_name} {conf:.2f} | unmapped"
 
                 cv2.rectangle(
                     self.current_frame,
@@ -213,33 +419,49 @@ class LaneProcessor:
                     box_color,
                     2
                 )
+                cv2.putText(
+                    self.current_frame,
+                    label,
+                    (x1, max(15, y1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    box_color,
+                    1
+                )
+                annotations.append(
+                    (x1, y1, x2, y2, box_color, label)
+                )
 
-        # Moving average of vehicles INSIDE monitoring zone
-        self.detection_history.append(current_count)
-
-        self.vehicle_count = int(
-            np.mean(self.detection_history)
-        )
-
-        # Weighted congestion
         weighted_count = (
-            self.bike_count * self.vehicle_weights["bike"] +
-            self.car_count * self.vehicle_weights["car"] +
-            self.bus_count * self.vehicle_weights["bus"] +
-            self.truck_count * self.vehicle_weights["truck"]
+            bike_count * self.vehicle_weights["bike"] +
+            car_count * self.vehicle_weights["car"] +
+            bus_count * self.vehicle_weights["bus"] +
+            truck_count * self.vehicle_weights["truck"]
         )
 
-        self.weighted_count = weighted_count
+        with self.statistics_lock:
+            self.detection_history.append(current_count)
 
-        # Density relative to calibrated road width
-        self.congestion_score = (
-            weighted_count / self.road_width
-            if self.road_width > 0
-            else 0
-        )
+            self.vehicle_count = int(
+                np.mean(self.detection_history)
+            )
+
+            self.car_count = car_count
+            self.bike_count = bike_count
+            self.bus_count = bus_count
+            self.truck_count = truck_count
+            self.weighted_count = weighted_count
+
+            self.congestion_score = (
+                weighted_count / self.road_width
+                if self.road_width > 0
+                else 0
+            )
+
+        return annotations
         
     def read_frame(self, visible=True):
-        """Read next frame. If visible=False, analyze but do not update dashboard display."""
+        """Read the next playback frame and save it when this lane is active."""
         if self.is_eof:
             return True
 
@@ -248,63 +470,31 @@ class LaneProcessor:
             self.is_eof = True
             return True
 
-        self.current_frame = frame.copy()
-        
         # Update display_frame only if this lane is currently 'active' visually
         if visible or self.display_frame is None:
-            self.display_frame = frame.copy()
+            self.display_frame = frame
 
-        self.detect_vehicles()
         return True
 
+    def prime_display_frame(self):
+        """Load a still frame so every dashboard panel is visible at startup."""
+        ret, frame = self.cap.read()
+        if not ret:
+            raise RuntimeError(
+                f"Unable to read initial display frame for lane {self.lane_id}"
+            )
+        self.display_frame = frame
+
     def reset_video(self):
-        """Restart video from frame 0."""
+        """Restart the normal video stream."""
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self.is_eof = False
-    
-        
-        # Lane header
-        cv2.rectangle(self.current_frame, (0, 0), (w, 60), (50, 50, 50), -1)
-        cv2.putText(self.current_frame, f"LANE {self.lane_id}", (10, 40), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        
-        # Vehicle count and density
-        # Vehicle information
-        cv2.putText(
-            self.current_frame,
-            f"Vehicles : {self.vehicle_count}",
-            (10, h-110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0,255,0),
-            2
-        )
-
-        cv2.putText(
-        self.current_frame,
-        f"Road Width : {self.road_width}",
-        (10, h-80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255,255,255),
-        2
-        )
-
-        cv2.putText(
-            self.current_frame,
-            f"Congestion : {self.congestion_score:.2f}",
-            (10, h-50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255,255,0),
-            2
-        )
-        
-        return self.current_frame
+        self.current_frame = None
+        self.display_frame = None
     
     def get_frame(self):
-        """Return the frame designated for display (stays frozen if not active)."""
-        return self.display_frame if self.display_frame is not None else self.current_frame
+        """Return this lane's persistent display frame without detection boxes."""
+        return self.display_frame
 
 class TrafficSignalController:
     """Manages 4-lane traffic signal logic"""
@@ -315,13 +505,25 @@ class TrafficSignalController:
         self.signal_start_time = 0
         self.signal_duration = 10
         self.time_remaining = 10
+        # One shared emergency model for all four lanes
+        self.emergency_model = YOLO("ambulance_best.pt")
+        self.emergency_state_lock = threading.Lock()
+
+# Emergency priority state
+        self.emergency_mode = False
+        self.emergency_lane_id = -1
+        self.signal_initialized = False
+        self.next_normal_lane = None
         
-        # Fairness tracking (time since last green)
-        self.last_green_time = [0] * 4
-        self.wait_time = [0] * 4
-        self.fairness_threshold = 120  # 2 minutes max wait
-        
-        # Signal timing based on vehicle count
+        self.preanalysis_lane = None
+        self.preanalysis_duration = None
+        self.last_preanalysis_log = None
+        self.preanalysis_request_id = None
+        self.preanalysis_completed_phase = None
+        self.preanalysis_weighted_count = None
+        self.preanalysis_congestion_score = None
+
+        # Green duration based on the selected lane's weighted vehicle count
         self.signal_durations = {
             (0, 10): 10,
             (10, 30): 20,
@@ -333,82 +535,231 @@ class TrafficSignalController:
         self.lanes = []
         for i, path in enumerate(video_paths):
             if os.path.exists(path):
-                lane = LaneProcessor(path, i+1)
+                lane = LaneProcessor(
+                    path,
+                    i + 1,
+                    self.emergency_model,
+                    self.emergency_state_lock
+                )
                 self.lanes.append(lane)
                 print(f"✅ Loaded Lane {i+1}: {path}")
             else:
                 print(f"❌ Lane {i+1} video not found: {path}")
                 # Create dummy lane if video missing
-                self.lanes.append(LaneProcessor(0, i+1))
+                self.lanes.append(
+    LaneProcessor(
+        0,
+        i + 1,
+        self.emergency_model,
+        self.emergency_state_lock
+    )
+)
     
-    def get_signal_duration(self, vehicle_count):
-        """Calculate green time based on vehicle count"""
+    def get_signal_duration(self, weighted_count):
+        """Calculate green time from the selected lane's weighted traffic."""
         for (min_count, max_count), duration in self.signal_durations.items():
-            if min_count <= vehicle_count < max_count:
+            if min_count <= weighted_count < max_count:
                 return duration
         return 30
     
+    def select_initial_lane(self):
+        """Choose the startup lane with the highest calibrated congestion."""
+        def get_congestion(lane_id):
+            lane = self.lanes[lane_id]
+            with lane.statistics_lock:
+                return lane.congestion_score
+
+        return max(
+            range(len(self.lanes)),
+            key=get_congestion
+        )
+
     def select_next_lane(self):
-        """Strict Round-Robin selection. Order: 1 -> 2 -> 3 -> 4."""
-        next_lane_idx = (self.current_green_lane + 1) % 4
-        # Note: adaptive duration is calculated inside switch_green_lane 
-        # using the vehicle_count prepared during the 5s background analysis.
-        self.switch_green_lane(next_lane_idx)
+        """Advance normal control in round-robin order."""
+        if self.next_normal_lane is not None:
+            self.switch_green_lane(self.next_normal_lane)
+
+    def prepare_next_lane(self):
+        lane_id = self.next_normal_lane
+        if lane_id is None:
+            return
+        lane = self.lanes[lane_id]
+        phase = (self.current_green_lane, self.signal_start_time)
+
+        if self.last_preanalysis_log != phase:
+            self.preanalysis_weighted_count = None
+            self.preanalysis_congestion_score = None
+            self.preanalysis_lane = lane_id
+            self.preanalysis_duration = None
+            self.preanalysis_completed_phase = None
+            self.preanalysis_request_id = lane.request_traffic_analysis()
+            self.last_preanalysis_log = phase
+            print(
+                f"PRE-ANALYSIS STARTED: Lane {lane_id + 1} "
+                f"(next round-robin lane; "
+                f"{self.time_remaining:.1f}s remaining)"
+            )
+
+        if (
+            lane.is_traffic_analysis_complete(self.preanalysis_request_id)
+            and self.preanalysis_completed_phase != phase
+        ):
+            with lane.statistics_lock:
+                weighted_count = lane.weighted_count
+                congestion_score = lane.congestion_score
+            self.preanalysis_weighted_count = weighted_count
+            self.preanalysis_congestion_score = congestion_score
+            self.preanalysis_duration = self.get_signal_duration(
+                weighted_count
+            )
+            print(
+                f"PRE-ANALYSIS COMPLETE: Lane {lane_id + 1} | "
+                f"weighted traffic = {weighted_count} | "
+                f"congestion = {congestion_score:.2f} | "
+                f"prepared green time = "
+                f"{self.preanalysis_duration} seconds"
+            )
+            self.preanalysis_completed_phase = phase
     
-    def switch_green_lane(self, lane_id):
+    def switch_green_lane(self, lane_id, initial=False):
         """Switch to new green lane"""
+        if self.emergency_mode:
+            self.current_green_lane = self.emergency_lane_id
+            return
+
+        previous_phase = (self.current_green_lane, self.signal_start_time)
+        prepared_duration = (
+            self.preanalysis_duration
+            if (
+                self.preanalysis_lane == lane_id
+                and self.preanalysis_completed_phase == previous_phase
+            )
+            else None
+        )
+
         self.current_green_lane = lane_id
-        self.last_green_time[lane_id] = time.time()
-        
-        vehicle_count = self.lanes[lane_id].vehicle_count
-        self.signal_duration = self.get_signal_duration(vehicle_count)
+        self.signal_initialized = True
+        self.next_normal_lane = (lane_id + 1) % len(self.lanes)
+        self.preanalysis_lane = None
+        self.preanalysis_duration = None
+        self.last_preanalysis_log = None
+        self.preanalysis_request_id = None
+        self.preanalysis_completed_phase = None
+        self.preanalysis_weighted_count = None
+        self.preanalysis_congestion_score = None
+
+        lane_traffic = []
+        for lane in self.lanes:
+            with lane.statistics_lock:
+                lane_traffic.append(
+                    (lane.weighted_count, lane.congestion_score)
+                )
+
+        weighted_count, congestion_score = lane_traffic[lane_id]
+        self.signal_duration = (
+            prepared_duration
+            if prepared_duration is not None
+            else self.get_signal_duration(weighted_count)
+        )
         self.signal_start_time = time.time()
         self.time_remaining = self.signal_duration
-        
-        print(f"\n🟢 GREEN → LANE {lane_id+1} | Vehicles: {vehicle_count} | Time: {self.signal_duration}s")
+
+        print("\nNORMAL SIGNAL DECISION")
+        for index, (traffic, congestion) in enumerate(lane_traffic):
+            print(
+                f"Lane {index + 1}: traffic/congestion = "
+                f"{traffic} weighted vehicles / {congestion:.2f}"
+            )
+        if initial:
+            print("INITIAL TRAFFIC")
+            for index, (traffic, congestion) in enumerate(lane_traffic):
+                print(
+                    f"Lane {index + 1} = weighted {traffic}, "
+                    f"congestion {congestion:.2f}"
+                )
+            print(f"INITIAL SELECTED LANE = Lane {lane_id + 1}")
+            print(f"GREEN TIME = {self.signal_duration} seconds")
+        print(f"Selected lane = Lane {lane_id + 1}")
+        print(f"Weighted traffic = {weighted_count}")
+        print(f"Green time = {self.signal_duration} seconds")
+        print(
+            f"\n🟢 GREEN → LANE {lane_id + 1} | "
+            f"Weighted vehicles: {weighted_count} | "
+            f"Congestion: {congestion_score:.2f} | "
+            f"Time: {self.signal_duration}s"
+        )
     
     def update_signal(self):
-        """Update signal timer and logic"""
+        """Update normal signal timing and emergency priority."""
+
+        # Check whether any lane has a confirmed ambulance
+        emergency_lane = -1
+
+        with self.emergency_state_lock:
+            emergency_lane = next(
+                (
+                    i for i, lane in enumerate(self.lanes)
+                    if lane.ambulance_detected
+                ),
+                -1
+            )
+
+    # Emergency priority
+        if emergency_lane != -1:
+            if (
+                not self.emergency_mode
+                or self.emergency_lane_id != emergency_lane
+            ):
+                print(
+                    f"\n🚦 EMERGENCY OVERRIDE → "
+                    f"Lane {emergency_lane + 1}"
+                )
+
+                self.emergency_mode = True
+                self.emergency_lane_id = emergency_lane
+
+                # Keep emergency lane green.
+                self.signal_duration = 999999
+                self.signal_start_time = time.time()
+                self.time_remaining = 999999
+
+            self.current_green_lane = emergency_lane
+            return
+
+    # Emergency cleared
+        if self.emergency_mode:
+            self.emergency_mode = False
+            self.emergency_lane_id = -1
+
+            print("🏥 Emergency cleared; resuming normal adaptive control.")
+            self.select_next_lane()
+            return
+
+# Normal signal timing
         current_time = time.time()
-        self.time_remaining = max(0, self.signal_duration - (current_time - self.signal_start_time))
-        
-        # Switch lane when time expires
+
+        self.time_remaining = max(
+        0,
+        self.signal_duration -
+        (current_time - self.signal_start_time)
+    )
+
+        if self.time_remaining <= 5:
+            self.prepare_next_lane()
+
         if self.time_remaining <= 0:
+            current_phase = (
+                self.current_green_lane,
+                self.signal_start_time
+            )
+            if (
+                self.preanalysis_lane != self.next_normal_lane
+                or self.preanalysis_completed_phase != current_phase
+                or self.preanalysis_duration is None
+            ):
+                return
             self.select_next_lane()
     
-    def draw_signal_status(self, frame, lane_id):
-        """Draw traffic light status on frame"""
-        h, w = frame.shape[:2]
-        
-        # Traffic light
-        light_y = 70
-        light_x = w // 2
-        
-        cv2.circle(frame, (light_x, light_y), 30, (0, 0, 100), -1)  # Background
-        
-        next_lane_idx = (self.current_green_lane + 1) % 4
-        
-        if lane_id == self.current_green_lane:
-            color, status = (0, 255, 0), "GREEN"
-        elif lane_id == next_lane_idx and self.time_remaining <= 5:
-            color, status = (0, 255, 255), "YELLOW"
-        else:
-            color, status = (0, 0, 255), "RED"
-        
-        cv2.circle(frame, (light_x, light_y), 25, color, -1)
-        
-        # Status text
-        cv2.putText(frame, status, (light_x - 40, light_y + 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-        # Global timer for green lane
-        if lane_id == self.current_green_lane:
-            timer_text = f"TIMER: {self.time_remaining:.1f}s"
-            cv2.putText(frame, timer_text, (10, h - 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        
-        return frame
-
 class FourLaneTrafficSystem:
     """Main 4-lane traffic management system"""
     
@@ -416,6 +767,8 @@ class FourLaneTrafficSystem:
         self.controller = TrafficSignalController()
         self.controller.load_lanes(video_paths)
         self.running = True
+        self.emergency_stop_event = threading.Event()
+        self.emergency_thread = None
         
         # Window names
         self.window_names = [f"Lane_{i+1}" for i in range(4)]
@@ -426,37 +779,63 @@ class FourLaneTrafficSystem:
         cv2.resizeWindow("AI Smart Traffic Dashboard", 1920, 1080)
     
     def process_all_lanes(self):
-        """Process all lanes and restart videos together after all reach EOF."""
+        """Process normal traffic frames for the four-lane dashboard."""
 
-        # Restart ALL videos only when ALL four have reached EOF
-        if all(lane.is_eof for lane in self.controller.lanes):
-            print("🔄 Dataset Round Complete: Restarting all lanes from frame 0...")
+        if len(self.controller.lanes) != 4:
+            raise RuntimeError(
+                f"Expected 4 lane processors, found {len(self.controller.lanes)}"
+            )
 
-            for lane in self.controller.lanes:
-                lane.reset_video()
+        for lane in self.controller.lanes:
+            lane.check_traffic_analysis_error()
 
         frames = []
+        green_lane = self.controller.current_green_lane
+        lane = self.controller.lanes[green_lane]
+        if lane.is_eof:
+            lane.reset_video()
+        lane.read_frame(visible=True)
+        if lane.is_eof:
+            lane.reset_video()
+            lane.read_frame(visible=True)
 
-        curr_green = self.controller.current_green_lane
-        next_lane = (curr_green + 1) % 4
-        is_pre_analysis_period = self.controller.time_remaining <= 5
+        for lane in self.controller.lanes:
+            frame = lane.get_frame()
+            if frame is None:
+                frame = np.zeros((450, 800, 3), dtype=np.uint8)
 
-        for i, lane in enumerate(self.controller.lanes):
-            if i == curr_green:
-                # Active Green: Advance video visually and analyze
-                lane.read_frame(visible=True)
-            elif i == next_lane and is_pre_analysis_period:
-                # Background Yellow: Analyze traffic but keep dashboard video frozen
-                lane.read_frame(visible=False)
-            
-            # Non-active lanes return their last frozen 'display_frame'
-            frame = self.controller.draw_signal_status(lane.get_frame(), i)
             frames.append(frame)
 
+        if len(frames) != 4:
+            raise RuntimeError(
+                f"Expected exactly 4 lane frames, received {len(frames)}"
+            )
+
         return frames, True
+
+    def monitor_emergencies(self):
+        """Scan every dedicated emergency stream outside the display loop."""
+        while not self.emergency_stop_event.is_set():
+            for lane in self.controller.lanes:
+                if self.emergency_stop_event.is_set():
+                    break
+
+                ret, frame = lane.emergency_cap.read()
+                if not ret:
+                    lane.emergency_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = lane.emergency_cap.read()
+
+                if ret:
+                    lane.detect_emergency(frame)
+                elif self.emergency_stop_event.wait(0.01):
+                    break
     
     def display_frames(self, frames):
         """Display all 4 lanes in one dashboard"""
+        if len(frames) != 4:
+            raise ValueError(
+                f"Expected exactly 4 lane frames, received {len(frames)}"
+            )
 
         processed = []
 
@@ -465,7 +844,6 @@ class FourLaneTrafficSystem:
             if frame is None:
                 frame = np.zeros((450, 800, 3), dtype=np.uint8)
 
-            # Resize FIRST
             frame = cv2.resize(frame, (800, 450))
 
              # Draw lane header
@@ -479,12 +857,16 @@ class FourLaneTrafficSystem:
                         2)
 
             lane = self.controller.lanes[i]
+            with lane.statistics_lock:
+                vehicle_count = lane.vehicle_count
+                road_width = lane.road_width
+                congestion_score = lane.congestion_score
 
             # Bottom information panel
             cv2.rectangle(frame, (0,390), (800,450), (30,30,30), -1)
 
             cv2.putText(frame,
-                        f"Vehicles : {lane.vehicle_count}",
+                        f"Vehicles : {vehicle_count}",
                         (20,415),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
@@ -492,7 +874,7 @@ class FourLaneTrafficSystem:
                         2)
 
             cv2.putText(frame,
-                        f"Width : {lane.road_width}",
+                        f"Width : {road_width}",
                         (260,415),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
@@ -500,21 +882,32 @@ class FourLaneTrafficSystem:
                         2)
 
             cv2.putText(frame,
-                        f"Congestion : {lane.congestion_score:.2f}",
+                        f"Congestion : {congestion_score:.2f}",
                         (420,415),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (0,255,255),
                         2)
 
-            next_lane = (self.controller.current_green_lane + 1) % 4
-
-            if i == self.controller.current_green_lane:
+            if (
+                self.controller.emergency_mode
+                and i == self.controller.current_green_lane
+            ):
                 color = (0,255,0)
                 status = "GREEN"
-            elif i == next_lane and self.controller.time_remaining <= 5:
+            elif not self.controller.signal_initialized:
+                color = (0,0,255)
+                status = "RED"
+            elif i == self.controller.current_green_lane:
+                color = (0,255,0)
+                status = "GREEN"
+            elif (
+                not self.controller.emergency_mode
+                and self.controller.time_remaining <= 5
+                and i == self.controller.preanalysis_lane
+            ):
                 color = (0,255,255)
-                status = "YELLOW"
+                status = "NEXT GREEN"
             else:
                 color = (0,0,255)
                 status = "RED"
@@ -523,15 +916,33 @@ class FourLaneTrafficSystem:
 
             cv2.putText(frame,
                         status,
-                        (610,32),
+                        (565 if status == "NEXT GREEN" else 610,32),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
+                        0.6 if status == "NEXT GREEN" else 0.7,
                         color,
                         2)
 
-            if i == self.controller.current_green_lane:
+            if (
+                self.controller.emergency_mode
+                and i == self.controller.current_green_lane
+            ):
+                timer_text = "EMERGENCY"
                 cv2.putText(frame,
-                            f"{self.controller.time_remaining:.1f}s",
+                            timer_text,
+                            (620,440),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0,255,255),
+                            2)
+            elif (
+                self.controller.signal_initialized
+                and i == self.controller.current_green_lane
+            ):
+                timer_text = (
+                    f"{self.controller.time_remaining:.1f}s"
+                )
+                cv2.putText(frame,
+                            timer_text,
                             (650,440),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.8,
@@ -552,41 +963,79 @@ class FourLaneTrafficSystem:
         print("🚦 4-LANE ADAPTIVE TRAFFIC SIGNAL SYSTEM")
         print("=" * 50)
         self.create_windows()
-        
-                # Analyze all four lanes before assigning the first green signal
-        for lane in self.controller.lanes:
-            lane.read_frame(visible=True)
-
-        initial_lane = max(
-            range(4),
-            key=lambda i: self.controller.lanes[i].congestion_score
+        self.emergency_thread = threading.Thread(
+            target=self.monitor_emergencies,
+            name="emergency-monitor",
+            daemon=True
         )
+        self.emergency_thread.start()
 
-        self.controller.switch_green_lane(initial_lane)
+        try:
+            for lane in self.controller.lanes:
+                lane.prime_display_frame()
 
-        print(
-            f"🚦 Initial priority: Lane {initial_lane + 1} "
-            f"(Congestion: {self.controller.lanes[initial_lane].congestion_score:.2f})"
-        )
+            for lane in self.controller.lanes:
+                lane.start_traffic_analysis()
+                lane.request_traffic_analysis()
+
+            while (
+                not all(
+                    lane.traffic_measurement_ready
+                    for lane in self.controller.lanes
+                )
+                or self.controller.emergency_mode
+            ):
+                for lane in self.controller.lanes:
+                    lane.check_traffic_analysis_error()
+                self.controller.update_signal()
+
+                if self.controller.emergency_mode:
+                    frames, _ = self.process_all_lanes()
+                else:
+                    frames = [
+                        lane.get_frame()
+                        for lane in self.controller.lanes
+                    ]
+                self.display_frames(frames)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    self.running = False
+                    break
+        except Exception:
+            self.cleanup()
+            raise
+
+        if not self.running:
+            self.cleanup()
+            return
+
+        if not self.controller.signal_initialized:
+            initial_lane = self.controller.select_initial_lane()
+            self.controller.switch_green_lane(initial_lane, initial=True)
 
         fps_counter = 0
         fps_time = time.time()
         
         while self.running:
-            frames, all_active = self.process_all_lanes()
-            
             # Update signal logic
             self.controller.update_signal()
             
             # Display frames
+            frames, all_active = self.process_all_lanes()
             self.display_frames(frames)
             
             # FPS counter
             fps_counter += 1
             if fps_counter % 30 == 0:
                 fps = 30 / (time.time() - fps_time)
+                timer_status = (
+                    "EMERGENCY"
+                    if self.controller.emergency_mode
+                    else f"T: {self.controller.time_remaining:.1f}s"
+                )
                 print(f"FPS: {fps:.1f} | Green: L{self.controller.current_green_lane+1} | "
-                      f"T: {self.controller.time_remaining:.1f}s")
+                      f"{timer_status}")
                 fps_time = time.time()
             
             # Handle key events (works across all windows)
@@ -595,18 +1044,26 @@ class FourLaneTrafficSystem:
                 self.running = False
             elif key == ord('r'):
                 for lane in self.controller.lanes:
-                    lane.vehicle_count = 0
-                    lane.detection_history.clear()
+                    with lane.statistics_lock:
+                        lane.vehicle_count = 0
+                        lane.detection_history.clear()
                 print("🔄 All counts reset!")
             elif key == ord('n'):
-                self.controller.switch_green_lane((self.controller.current_green_lane + 1) % 4)
+                self.controller.select_next_lane()
         
         self.cleanup()
     
     def cleanup(self):
         """Cleanup resources"""
+        self.emergency_stop_event.set()
+        if self.emergency_thread is not None:
+            self.emergency_thread.join()
+
         for lane in self.controller.lanes:
+            lane.stop_vehicle_detection()
             lane.cap.release()
+            lane.traffic_cap.release()
+            lane.emergency_cap.release()
         cv2.destroyAllWindows()
         print("\n📊 Final Statistics:")
         for i, lane in enumerate(self.controller.lanes):
