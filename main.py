@@ -15,7 +15,8 @@ class LaneProcessor:
         video_path,
         lane_id,
         emergency_model=None,
-        emergency_state_lock=None
+        emergency_state_lock=None,
+        config_file=None
     ):
          self.lane_id = lane_id
          self.video_path = video_path
@@ -23,9 +24,12 @@ class LaneProcessor:
          self.traffic_cap = cv2.VideoCapture(video_path)
          self.display_frame = None
          self.is_eof = False
+         self.video_lock = threading.Lock()
 
          # Normal traffic model
-         self.model = YOLO("yolov11n.pt")
+         self.model = YOLO(
+             "yolo11n.pt" if lane_id == 3 else "yolov11n.pt"
+         )
 
 # Emergency model is passed from the controller
          self.emergency_model = emergency_model
@@ -63,44 +67,8 @@ class LaneProcessor:
         }
 
                        # Load lane-specific metric calibration
-         config_file = f"config_lane{lane_id}.json"
-
-         if os.path.exists(config_file):
-            with open(config_file, "r") as f:
-                calibration = json.load(f)
-
-            self.road_width = float(calibration["reference_width_m"])
-
-            # Homography: image pixels -> real-world ground coordinates
-            self.H = np.array(
-                calibration["homography_matrix"],
-                dtype=np.float64
-            )
-
-            # Monitoring zone in meters
-            zone = calibration.get(
-                "monitoring_zone_meters",
-                {
-                    "min_y": 0.0,
-                    "max_y": 20.0
-                }
-            )
-
-            self.min_y = float(zone["min_y"])
-            self.max_y = float(zone["max_y"])
-
-            print(
-                f"✅ Lane {lane_id} calibration loaded | "
-                f"Width = {self.road_width:.2f} m | "
-                f"Zone = {self.min_y:.1f}-{self.max_y:.1f} m"
-            )
-
-         else:
-            print(f"⚠️ Calibration file not found: {config_file}")
-            self.road_width = 1.0
-            self.H = np.eye(3)
-            self.min_y = 0.0
-            self.max_y = 20.0
+         self.config_file = config_file or f"config_lane{lane_id}.json"
+         self._load_calibration(self.config_file, required=config_file is not None)
 
          self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
          self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -133,6 +101,130 @@ class LaneProcessor:
          self.traffic_measurement_ready = False
          self.analysis_revision = 0
          self._inference_thread = None
+
+    def _load_calibration(self, config_file, required=False):
+        if not os.path.exists(config_file):
+            if required:
+                raise FileNotFoundError(config_file)
+            print(f"⚠️ Calibration file not found: {config_file}")
+            self.road_width = 1.0
+            self.H = np.eye(3)
+            self.min_y = 0.0
+            self.max_y = 20.0
+            return
+
+        with open(config_file, "r") as f:
+            calibration = json.load(f)
+
+        self.road_width = float(calibration["reference_width_m"])
+        self.H = np.array(
+            calibration["homography_matrix"],
+            dtype=np.float64
+        )
+        zone = calibration.get(
+            "monitoring_zone_meters",
+            {
+                "min_y": 0.0,
+                "max_y": 20.0
+            }
+        )
+        self.min_y = float(zone["min_y"])
+        self.max_y = float(zone["max_y"])
+        self.config_file = config_file
+
+        print(
+            f"✅ Lane {self.lane_id} calibration loaded | "
+            f"Width = {self.road_width:.2f} m | "
+            f"Zone = {self.min_y:.1f}-{self.max_y:.1f} m"
+        )
+
+    def switch_video(self, video_path, config_file):
+        if self.lane_id != 3:
+            raise ValueError("Video switching is only supported for Lane 3")
+        if self.video_path == video_path and self.config_file == config_file:
+            return False
+
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(video_path)
+        with open(config_file, "r") as f:
+            calibration = json.load(f)
+
+        new_caps = [cv2.VideoCapture(video_path) for _ in range(3)]
+        if not all(cap.isOpened() for cap in new_caps):
+            for cap in new_caps:
+                cap.release()
+            raise RuntimeError(f"Unable to open Lane 3 video: {video_path}")
+
+        ret, display_frame = new_caps[0].read()
+        if not ret:
+            for cap in new_caps:
+                cap.release()
+            raise RuntimeError(f"Unable to read Lane 3 video: {video_path}")
+
+        with self.video_lock:
+            self.cap.release()
+            self.traffic_cap.release()
+            self.emergency_cap.release()
+            self.cap, self.traffic_cap, self.emergency_cap = new_caps
+            self.video_path = video_path
+            self.display_frame = display_frame
+            self.is_eof = False
+            self.current_frame = None
+            self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            self.road_width = float(calibration["reference_width_m"])
+            self.H = np.array(
+                calibration["homography_matrix"],
+                dtype=np.float64
+            )
+            zone = calibration.get(
+                "monitoring_zone_meters",
+                {
+                    "min_y": 0.0,
+                    "max_y": 20.0
+                }
+            )
+            self.min_y = float(zone["min_y"])
+            self.max_y = float(zone["max_y"])
+            self.config_file = config_file
+
+            with self.statistics_lock:
+                self.vehicle_count = 0
+                self.car_count = 0
+                self.bike_count = 0
+                self.bus_count = 0
+                self.truck_count = 0
+                self.weighted_count = 0
+                self.queue_length = 0
+                self.congestion_score = 0
+                self.detection_history.clear()
+                self.detection_overlay = []
+                self.traffic_measurement_ready = False
+                self.analysis_revision = 0
+
+            with self.emergency_state_lock:
+                self.ambulance_detected = False
+                self.consecutive_ambulance_frames = 0
+                self.clearance_counter = 0
+                self.clearance_started_at = None
+                self.last_emergency_diagnostic_at = 0.0
+
+            with self._analysis_request_lock:
+                self._pending_analysis_request_ids.clear()
+                while self._analysis_requests.acquire(blocking=False):
+                    pass
+                self._completed_analysis_request_id = (
+                    self._next_analysis_request_id
+                )
+
+        print(
+            f"✅ Lane 3 video switched to {video_path} "
+            f"with {config_file}"
+        )
+        if self._inference_thread is not None:
+            self.request_traffic_analysis()
+        return True
 
     def start_traffic_analysis(self):
         if self._inference_thread is not None:
@@ -174,35 +266,38 @@ class LaneProcessor:
             if self._analysis_stop_event.is_set():
                 return
 
-            with self._analysis_request_lock:
-                request_id = self._pending_analysis_request_ids.popleft()
-
             started_at = time.perf_counter()
             try:
-                ret, frame = self.traffic_cap.read()
-                if not ret:
-                    self.traffic_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                with self.video_lock:
+                    with self._analysis_request_lock:
+                        if not self._pending_analysis_request_ids:
+                            continue
+                        request_id = self._pending_analysis_request_ids.popleft()
+
                     ret, frame = self.traffic_cap.read()
-                if not ret:
-                    raise RuntimeError(
-                        f"Unable to read traffic-analysis video for "
-                        f"lane {self.lane_id}"
-                    )
-                self.current_frame = frame
-                annotations = self.detect_vehicles()
+                    if not ret:
+                        self.traffic_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = self.traffic_cap.read()
+                    if not ret:
+                        raise RuntimeError(
+                            f"Unable to read traffic-analysis video for "
+                            f"lane {self.lane_id}"
+                        )
+                    self.current_frame = frame
+                    annotations = self.detect_vehicles()
+
+                    elapsed = time.perf_counter() - started_at
+                    with self.statistics_lock:
+                        self.detection_overlay = annotations
+                        self.inference_count += 1
+                        self.inference_elapsed += elapsed
+                        self.traffic_measurement_ready = True
+                        self.analysis_revision += 1
+                    with self._analysis_request_lock:
+                        self._completed_analysis_request_id = request_id
             except Exception as error:
                 self._set_traffic_analysis_error(error)
                 return
-
-            elapsed = time.perf_counter() - started_at
-            with self.statistics_lock:
-                self.detection_overlay = annotations
-                self.inference_count += 1
-                self.inference_elapsed += elapsed
-                self.traffic_measurement_ready = True
-                self.analysis_revision += 1
-            with self._analysis_request_lock:
-                self._completed_analysis_request_id = request_id
 
     def stop_vehicle_detection(self):
         self._analysis_stop_event.set()
@@ -441,10 +536,7 @@ class LaneProcessor:
 
         with self.statistics_lock:
             self.detection_history.append(current_count)
-
-            self.vehicle_count = int(
-                np.mean(self.detection_history)
-            )
+            self.vehicle_count = current_count
 
             self.car_count = car_count
             self.bike_count = bike_count
@@ -462,35 +554,38 @@ class LaneProcessor:
         
     def read_frame(self, visible=True):
         """Read the next playback frame and save it when this lane is active."""
-        if self.is_eof:
+        with self.video_lock:
+            if self.is_eof:
+                return True
+
+            ret, frame = self.cap.read()
+            if not ret:
+                self.is_eof = True
+                return True
+
+            # Update display_frame only if this lane is currently 'active' visually
+            if visible or self.display_frame is None:
+                self.display_frame = frame
+
             return True
-
-        ret, frame = self.cap.read()
-        if not ret:
-            self.is_eof = True
-            return True
-
-        # Update display_frame only if this lane is currently 'active' visually
-        if visible or self.display_frame is None:
-            self.display_frame = frame
-
-        return True
 
     def prime_display_frame(self):
         """Load a still frame so every dashboard panel is visible at startup."""
-        ret, frame = self.cap.read()
-        if not ret:
-            raise RuntimeError(
-                f"Unable to read initial display frame for lane {self.lane_id}"
-            )
-        self.display_frame = frame
+        with self.video_lock:
+            ret, frame = self.cap.read()
+            if not ret:
+                raise RuntimeError(
+                    f"Unable to read initial display frame for lane {self.lane_id}"
+                )
+            self.display_frame = frame
 
     def reset_video(self):
         """Restart the normal video stream."""
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.is_eof = False
-        self.current_frame = None
-        self.display_frame = None
+        with self.video_lock:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.is_eof = False
+            self.current_frame = None
+            self.display_frame = None
     
     def get_frame(self):
         """Return this lane's persistent display frame without detection boxes."""
@@ -539,7 +634,8 @@ class TrafficSignalController:
                     path,
                     i + 1,
                     self.emergency_model,
-                    self.emergency_state_lock
+                    self.emergency_state_lock,
+                    "config_lane5.json" if i == 2 else None
                 )
                 self.lanes.append(lane)
                 print(f"✅ Loaded Lane {i+1}: {path}")
@@ -813,6 +909,18 @@ class FourLaneTrafficSystem:
 
         return frames, True
 
+    def switch_lane3_video(self, video_path, config_file):
+        lane = self.controller.lanes[2]
+        if lane.switch_video(video_path, config_file):
+            if self.controller.preanalysis_lane == 2:
+                self.controller.preanalysis_lane = None
+                self.controller.preanalysis_duration = None
+                self.controller.last_preanalysis_log = None
+                self.controller.preanalysis_request_id = None
+                self.controller.preanalysis_completed_phase = None
+                self.controller.preanalysis_weighted_count = None
+                self.controller.preanalysis_congestion_score = None
+
     def monitor_emergencies(self):
         """Scan every dedicated emergency stream outside the display loop."""
         while not self.emergency_stop_event.is_set():
@@ -820,14 +928,15 @@ class FourLaneTrafficSystem:
                 if self.emergency_stop_event.is_set():
                     break
 
-                ret, frame = lane.emergency_cap.read()
-                if not ret:
-                    lane.emergency_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                with lane.video_lock:
                     ret, frame = lane.emergency_cap.read()
+                    if not ret:
+                        lane.emergency_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = lane.emergency_cap.read()
 
-                if ret:
-                    lane.detect_emergency(frame)
-                elif self.emergency_stop_event.wait(0.01):
+                    if ret:
+                        lane.detect_emergency(frame)
+                if not ret and self.emergency_stop_event.wait(0.01):
                     break
     
     def display_frames(self, frames):
@@ -861,12 +970,25 @@ class FourLaneTrafficSystem:
                 vehicle_count = lane.vehicle_count
                 road_width = lane.road_width
                 congestion_score = lane.congestion_score
+            analysis_pending = (
+                self.controller.preanalysis_lane == i
+                and self.controller.preanalysis_request_id is not None
+                and not lane.is_traffic_analysis_complete(
+                    self.controller.preanalysis_request_id
+                )
+            )
+            vehicle_count_text = (
+                "--" if analysis_pending else str(vehicle_count)
+            )
+            congestion_text = (
+                "--" if analysis_pending else f"{congestion_score:.2f}"
+            )
 
             # Bottom information panel
             cv2.rectangle(frame, (0,390), (800,450), (30,30,30), -1)
 
             cv2.putText(frame,
-                        f"Vehicles : {vehicle_count}",
+                        f"Vehicles : {vehicle_count_text}",
                         (20,415),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
@@ -882,7 +1004,7 @@ class FourLaneTrafficSystem:
                         2)
 
             cv2.putText(frame,
-                        f"Congestion : {congestion_score:.2f}",
+                        f"Congestion : {congestion_text}",
                         (420,415),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
@@ -907,7 +1029,7 @@ class FourLaneTrafficSystem:
                 and i == self.controller.preanalysis_lane
             ):
                 color = (0,255,255)
-                status = "NEXT GREEN"
+                status = "Yellow"
             else:
                 color = (0,0,255)
                 status = "RED"
@@ -916,9 +1038,9 @@ class FourLaneTrafficSystem:
 
             cv2.putText(frame,
                         status,
-                        (565 if status == "NEXT GREEN" else 610,32),
+                        (565 if status == "Yellow" else 610,32),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6 if status == "NEXT GREEN" else 0.7,
+                        0.6 if status == "Yellow" else 0.7,
                         color,
                         2)
 
@@ -1002,6 +1124,10 @@ class FourLaneTrafficSystem:
                 if key == ord('q'):
                     self.running = False
                     break
+                elif key == ord('3'):
+                    self.switch_lane3_video("lane3.mp4", "config_lane3.json")
+                elif key == ord('5'):
+                    self.switch_lane3_video("lane5.mp4", "config_lane5.json")
         except Exception:
             self.cleanup()
             raise
@@ -1042,6 +1168,10 @@ class FourLaneTrafficSystem:
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 self.running = False
+            elif key == ord('3'):
+                self.switch_lane3_video("lane3.mp4", "config_lane3.json")
+            elif key == ord('5'):
+                self.switch_lane3_video("lane5.mp4", "config_lane5.json")
             elif key == ord('r'):
                 for lane in self.controller.lanes:
                     with lane.statistics_lock:
@@ -1078,7 +1208,7 @@ def main():
     video_paths = [
         "lane1.mp4",
         "lane2.mp4", 
-        "lane3.mp4",
+        "lane5.mp4",
         "lane4.mp4"
     ]
     
